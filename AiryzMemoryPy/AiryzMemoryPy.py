@@ -2,12 +2,29 @@ import subprocess;
 from ctypes import *
 from ctypes.wintypes import *
 from struct import *
+import platform
+import collections
 
 k32 = windll.kernel32
 
 OpenProcess = k32.OpenProcess
 OpenProcess.argtypes = [DWORD,BOOL,DWORD]
 OpenProcess.restype = HANDLE
+
+IsWow64Process = k32.IsWow64Process
+
+long = c_long
+byte = c_byte
+double = c_double
+char = c_char
+short = c_short
+ushort = c_ushort
+
+class padding():
+    size = 0;
+    def __init__(self, _size):
+        self.size = _size
+
 
 ReadProcessMemory = k32.ReadProcessMemory
 ReadProcessMemory.argtypes = [HANDLE,LPCVOID,c_void_p,c_size_t,POINTER(c_size_t)]
@@ -24,6 +41,16 @@ GetModuleBaseNameA.argtypes = [HANDLE,LPCVOID,LPCVOID,DWORD]
 
 GetModuleInformation = windll.psapi.GetModuleInformation
 GetModuleInformation.argtypes = [HANDLE,LPCVOID,LPCVOID,POINTER(DWORD)]
+
+class MetaStruct(type):
+    @classmethod
+    def __prepare__(self, name, bases):
+        return collections.OrderedDict()
+
+    def __new__(self, name, bases, classdict):
+        classdict['__ordered__'] = [key for key in classdict.keys()
+                if key not in ('__module__', '__qualname__')]
+        return type.__new__(self, name, bases, classdict)
 
 class MEMORY_BASIC_INFORMATION(Structure):
     _fields_ = [("BaseAddress", LPVOID), 
@@ -96,6 +123,18 @@ class AiryzMemory():
                     return hModules[i];
         return 0;
     
+    def __is_os_64bit(self):
+        return platform.machine().endswith('64')
+
+    def is_process_64bit(self):
+        
+        if not self.__is_os_64bit():
+            return False
+        i = c_int()
+        IsWow64Process(self.hProcess, byref(i))
+        return i.value == 0
+
+
     def get_module_info(self, hModule):
         info = MODULEINFO();
         size = DWORD()
@@ -115,6 +154,58 @@ class AiryzMemory():
         
 
 
+
+    type_to_format = {int:'i', float:'f', long:'q', double:'d', char:'c', bool:'?', short:'h', ushort:'H'}
+
+    def get_format_for_struct(self, struct):
+    
+        template = struct()
+        members = [attr for attr in template.__ordered__ if not callable(getattr(template, attr)) and not attr.startswith("__")]
+        fmt = ''
+    
+        for m in members:
+            attribute = getattr(template, m)
+            t = type(attribute)
+            if(isinstance(attribute, padding)):
+                size = attribute.size
+                fmt += 'B' * size
+            elif t in self.type_to_format:
+                fmt += self.type_to_format[t]
+            else:
+                fmt += self.get_format_for_struct(t)
+        return fmt 
+    
+    
+    def get_num_of_values(self, struct):
+        template = struct()
+        members = [attr for attr in template.__ordered__ if not callable(getattr(template, attr)) and not attr.startswith("__")]
+        return len(members)
+    
+    def data_to_class(self, struct, values):
+        template = struct()
+        members = [attr for attr in template.__ordered__ if not callable(getattr(template, attr)) and not attr.startswith("__")]
+    
+        value_index = 0
+        for i in range(len(members)):
+            attribute = getattr(template, members[i])
+            t = type(attribute)
+            if isinstance(attribute, padding):
+                size = attribute.size
+                value_index += size
+            elif t in self.type_to_format:
+                setattr(template, members[i], values[value_index])
+                value_index += 1
+            else:
+                num = self.get_num_of_values(t)
+                setattr(template, members[i], self.data_to_class(t, values[value_index:value_index+num]))
+                value_index += num
+        return template
+
+    def read_class(self, c, address):
+        fmt = self.get_format_for_struct(c)
+        data = self.read_struct(fmt, address)
+        return self.data_to_class(c, data)
+
     #Reading
     def read_memory(self, address, length):
         """ Read an array of bytes from process memory"""
@@ -129,6 +220,19 @@ class AiryzMemory():
             windll.kernel32.CloseHandle(self.hProcess)
             windll.kernel32.SetLastError(10000)
 
+    def read_pointer(self, offsets):
+        is64 = self.is_process_64bit()
+        address = 0
+        count = len(offsets)
+        for i in range(count):
+            if i < count - 1:
+                if is64:
+                    address = self.read_long(address + offsets[i])
+                else:
+                    address = self.read_int(address + offsets[i])
+            else:
+                return address + offsets[i]
+
     def read_struct(self, format, address):
         """ Read structure from memory address """
         buffer = self.read_memory(address, calcsize(format))
@@ -140,6 +244,9 @@ class AiryzMemory():
 
     def read_int(self, address):
         return self.read_struct('i', address)[0]
+
+    def read_long(self, address):
+        return self.read_struct('Q', address)[0]
 
 
     #Writing
@@ -166,5 +273,4 @@ class AiryzMemory():
 
     def write_struct(self, format, address, values):
         b = pack(format, *values)
-        print(len(b))
         self.write_memory(address, b)
